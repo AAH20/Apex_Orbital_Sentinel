@@ -90,6 +90,42 @@ graph TB
     MSG --> C2SYS
 ```
 
+### System Context
+
+```mermaid
+graph LR
+    subgraph EXTERNAL["External Systems"]
+        OPS[Satellite Operators]
+        SENS[Sensor Networks]
+        WX_SVC[Space Weather Services]
+        COAL_OPS[Coalition Partners]
+    end
+
+    subgraph AOS["Apex Orbital Sentinel"]
+        CORE[Core Platform]
+        API[REST / gRPC API]
+        UI[Operator Dashboard]
+    end
+
+    subgraph GROUND["Ground Infrastructure"]
+        GS[Ground Stations]
+        DB[(SQLite / PostgreSQL)]
+        MSG_BUS[Message Bus]
+    end
+
+    OPS -->|TLE/OMM| AOS
+    SENS -->|Observations| AOS
+    WX_SVC -->|Alerts| AOS
+    COAL_OPS -->|CDMs| AOS
+    AOS -->|Commands| OPS
+    AOS -->|CDMs| COAL_OPS
+    AOS -->|Telemetry| GS
+    AOS --- DB
+    AOS --- MSG_BUS
+    API --- CORE
+    UI --- CORE
+```
+
 ### Data Flow
 
 ```mermaid
@@ -173,6 +209,19 @@ sequenceDiagram
     P->>O: Return TEME state vector
 ```
 
+### SGP4 vs SDP4 Decision Logic
+
+```mermaid
+flowchart LR
+    TLE[TLE Data] --> PERIOD{Calculate Period<br/>from Mean Motion}
+    PERIOD -->|Period < 225 min| SGP4[SGP4 Near-Earth Model]
+    PERIOD -->|Period >= 225 min| SDP4[SDP4 Deep-Space Model]
+    SGP4 --> LEO[LEO / MEO Objects]
+    SDP4 --> GEO[GEO / HEO / Cislunar]
+    LEO --> OUTPUT[State Vector km, km/s]
+    GEO --> OUTPUT
+```
+
 ---
 
 ## Conjunction Detection
@@ -230,6 +279,29 @@ classDiagram
 5. **Filter** by threshold (default: 10 km)
 6. **Generate** CDM for qualifying events
 
+### Conjunction Detection Sequence
+
+```mermaid
+sequenceDiagram
+    participant Cat as Catalog
+    participant Prop as Propagator
+    participant Det as Detector
+    participant CDM as CDM Generator
+    participant Msg as Messaging
+
+    Cat->>Prop: Primary TLE
+    Cat->>Prop: Secondary TLE
+    Prop->>Det: State vector A (t)
+    Prop->>Det: State vector B (t)
+    Det->>Det: Relative position r = rA - rB
+    Det->>Det: Relative velocity v = vA - vB
+    Det->>Det: TCA = -(r·v)/(v·v)
+    Det->>Det: Miss distance at TCA
+    Det->>Det: P_c = exp(-d²/2R²)
+    Det->>CDM: ConjunctionEvent
+    CDM->>Msg: CCSDS CDM Packet
+```
+
 ---
 
 ## Collision Avoidance & Maneuver Planning
@@ -279,6 +351,23 @@ sequenceDiagram
     P->>O: ManeuverPlan
     O->>O: Approve / Modify
     O->>P: Execute command
+```
+
+### Maneuver Optimization Pipeline
+
+```mermaid
+flowchart LR
+    INPUT[Conjunction Event] --> ANALYZE[Analyze Geometry]
+    ANALYZE --> DOM{Dominant Axis}
+    DOM -->|Along-track| AT[Along-Track Burn]
+    DOM -->|Cross-track| CT[Cross-Track Burn]
+    DOM -->|Radial| RAD[Radial Burn]
+    AT --> OPT[Optimize Burn Time]
+    CT --> OPT
+    RAD --> OPT
+    OPT --> DV[Compute Delta-V]
+    DV --> FUEL[Fuel Budget Check]
+    FUEL --> PLAN[Final Maneuver Plan]
 ```
 
 ---
@@ -340,8 +429,40 @@ flowchart TD
     PAIRS --> UF[Initialize Union-Find]
     PAIRS --> UNION[Union nodes within threshold]
     UNION --> ROOTS[Find root for each node]
-    ROUPS --> GROUP[Group by root]
+    ROOTS --> GROUP[Group by root]
     GROUP --> RESULT[Return clusters]
+```
+
+### Orbital Graph Schema
+
+```mermaid
+erDiagram
+    NODE ||--o{ EDGE : "source"
+    NODE ||--o{ EDGE : "target"
+    NODE {
+        string id PK
+        string name
+        string regime "LEO/MEO/GEO/Cislunar"
+        float inclination_deg
+        float altitude_km
+        vector3 position
+        vector3 velocity
+        datetime epoch
+    }
+    EDGE {
+        string source FK
+        string target FK
+        string type "proximity/comm/coverage"
+        float weight_km
+        datetime created_at
+    }
+    CLUSTER ||--o{ NODE : "contains"
+    CLUSTER {
+        int cluster_id PK
+        int node_count
+        string dominant_regime
+        float max_internal_distance_km
+    }
 ```
 
 ---
@@ -410,6 +531,30 @@ flowchart LR
     O --> CRITICAL{Critical?}
     CRITICAL -->|Rad=High AND Comm=High| ALERT[CRITICAL Alert]
     CRITICAL -->|Otherwise| NORMAL[Standard Alert]
+```
+
+### Space Weather Decision Tree
+
+```mermaid
+flowchart TD
+    XRAY[X-ray Flux] --> XCLASS{Class?}
+    XCLASS -->|A/B/C| LOW_RISK[Low Radiation Risk]
+    XCLASS -->|M| MOD_RISK[Moderate Radiation Risk]
+    XCLASS -->|X| HIGH_RISK[High Radiation Risk]
+
+    KP[Kp Index] --> KCLASS{Storm Level?}
+    KCLASS -->|Kp <= 4| QUIET[Quiet Conditions]
+    KCLASS -->|Kp 5-6| MINOR[G1-G2 Minor-Moderate]
+    KCLASS -->|Kp 7-8| STRONG[G3-G4 Strong-Severe]
+    KCLASS -->|Kp 9| EXTREME[G5 Extreme]
+
+    LOW_RISK --> OVERALL[Overall Assessment]
+    MOD_RISK --> OVERALL
+    HIGH_RISK --> OVERALL
+    QUIET --> OVERALL
+    MINOR --> OVERALL
+    STRONG --> OVERALL
+    EXTREME --> OVERALL
 ```
 
 ---
@@ -487,6 +632,26 @@ flowchart LR
     Q3 --> P
 
     P --> H[Execute Handlers]
+```
+
+### Messaging Sequence
+
+```mermaid
+sequenceDiagram
+    participant S as Sender
+    participant R as Router
+    participant Q as Queue
+    participant H as Handler
+    participant D as Destination
+
+    S->>R: CCSDS Message (priority=HIGH)
+    R->>Q: Enqueue HIGH
+    Q->>H: Dequeue next
+    H->>H: Parse headers
+    H->>H: Validate coalition access
+    H->>D: Deliver payload
+    D-->>H: ACK
+    H-->>S: Delivery confirmation
 ```
 
 ---
@@ -592,6 +757,27 @@ sequenceDiagram
     C2->>Op1: Command COMPLETED
 ```
 
+### F2T2EA Kill Chain Integration
+
+```mermaid
+flowchart LR
+    FIND[Find] --> TRACK[Track]
+    TRACK --> IDENTIFY[Identify]
+    IDENTIFY --> DECIDE[Decide]
+    DECIDE --> ENGAGE[Engage]
+    ENGAGE --> ASSESS[Assess]
+    ASSESS --> FIND
+
+    subgraph AOS["AOS Mapping"]
+        FIND --> SDA[SDA Pipeline]
+        TRACK --> GRAPH[Orbital Graph]
+        IDENTIFY --> CLASS[Object Classification]
+        DECIDE --> MP[Maneuver Planner]
+        ENGAGE --> C2[C2 Command]
+        ASSESS --> CDM[CDM Feedback]
+    end
+```
+
 ---
 
 ## Debris Tracking
@@ -645,6 +831,39 @@ flowchart LR
     F --> G[Risk Level]
     G --> H[Conjunction Scan]
     H --> I[Collision Probability]
+```
+
+### Debris Catalog Schema
+
+```mermaid
+erDiagram
+    DEBRIS_OBJECT {
+        int norad_id PK
+        string name
+        string object_type "rocket_body/debris/payload"
+        float size_m
+        float mass_kg
+        float radar_cross_section
+        datetime epoch
+        string regime "LEO/MEO/GEO"
+    }
+    TRAJECTORY {
+        int id PK
+        int norad_id FK
+        datetime epoch
+        vector3 position
+        vector3 velocity
+    }
+    RISK_ASSESSMENT {
+        int id PK
+        int norad_id FK
+        datetime assessment_time
+        float miss_distance_km
+        float collision_probability
+        string risk_level "LOW/MEDIUM/HIGH/CRITICAL"
+    }
+    DEBRIS_OBJECT ||--o{ TRAJECTORY : "has"
+    DEBRIS_OBJECT ||--o{ RISK_ASSESSMENT : "evaluated by"
 ```
 
 ---
@@ -737,23 +956,23 @@ sequenceDiagram
 
 ### Feature Matrix
 
-| Feature | AOS | LeoLabs | Slingshot Aerospace | Kayhan Space | SpaceX Stargaze |
-|---------|-----|---------|---------------------|--------------|-----------------|
-| **Orbit Propagation** | SGP4/SDP4 (native) | Proprietary | Proprietary | Proprietary | Star tracker data |
-| **Conjunction Detection** | ✅ Native | ✅ | ✅ | ✅ | ✅ |
-| **Collision Probability** | ✅ 2D Gaussian | ✅ | ✅ | ✅ | ✅ |
-| **Maneuver Planning** | ✅ Fuel-optimal | ❌ | ❌ | ✅ | ❌ |
-| **CDM Generation** | ✅ CCSDS | ✅ | ✅ | ✅ | ❌ |
-| **Space Weather** | ✅ Flare + Storm | ❌ | ❌ | ❌ | ❌ |
-| **Debris Tracking** | ✅ Catalog + Risk | ✅ | ✅ | ✅ | ❌ |
-| **Orbital Graph** | ✅ Native | ❌ | ❌ | ❌ | ❌ |
-| **Inter-Operator Messaging** | ✅ CCSDS | ❌ | ❌ | ❌ | ❌ |
-| **Coalition Federation** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| **C2 Integration** | ✅ Full F2T2EA | ❌ | ❌ | ❌ | ❌ |
-| **Cislunar Coverage** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| **Sensor Agnostic** | ✅ Multi-source | ❌ Proprietary radar | ❌ Proprietary | ❌ Proprietary | ❌ Star trackers |
-| **Autonomous Decision** | ✅ Agentic AI | ❌ Human-in-loop | ❌ Human-in-loop | ❌ Human-in-loop | ❌ |
-| **Open Standards** | ✅ CCSDS | ❌ | ❌ | ❌ | ❌ |
+| Feature | AOS | LeoLabs | Slingshot Aerospace | Planet | Kayhan Space | SpaceX Stargaze |
+|---------|-----|---------|---------------------|--------|--------------|-----------------|
+| **Orbit Propagation** | SGP4/SDP4 (native) | Proprietary | Proprietary | Proprietary (Dove sats) | Proprietary | Star tracker data |
+| **Conjunction Detection** | ✅ Native | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Collision Probability** | ✅ 2D Gaussian | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Maneuver Planning** | ✅ Fuel-optimal | ❌ | ❌ | ❌ | ✅ | ❌ |
+| **CDM Generation** | ✅ CCSDS | ✅ | ✅ | ✅ | ✅ | ❌ |
+| **Space Weather** | ✅ Flare + Storm | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Debris Tracking** | ✅ Catalog + Risk | ✅ | ✅ | ✅ | ✅ | ❌ |
+| **Orbital Graph** | ✅ Native | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Inter-Operator Messaging** | ✅ CCSDS | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Coalition Federation** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **C2 Integration** | ✅ Full F2T2EA | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Cislunar Coverage** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Sensor Agnostic** | ✅ Multi-source | ❌ Proprietary radar | ❌ Proprietary | ❌ Proprietary (optical) | ❌ Proprietary | ❌ Star trackers |
+| **Autonomous Decision** | ✅ Agentic AI | ❌ Human-in-loop | ❌ Human-in-loop | ❌ Human-in-loop | ❌ Human-in-loop | ❌ |
+| **Open Standards** | ✅ CCSDS | ❌ | ❌ | ❌ | ❌ | ❌ |
 
 ### Architecture Comparison
 
@@ -781,6 +1000,13 @@ graph TB
         S1 --> S2 --> S3
     end
 
+    subgraph PLANET["Planet"]
+        P1[Proprietary Optical]
+        P2[Imagery Platform]
+        P3[Human Analysis]
+        P1 --> P2 --> P3
+    end
+
     subgraph KAY["Kayhan Space"]
         K1[Proprietary Sensors]
         K2[Conjunction Detection]
@@ -798,15 +1024,15 @@ graph TB
 
 ### Performance Benchmarks
 
-| Metric | AOS | LeoLabs | Slingshot | Kayhan | Stargaze |
-|--------|-----|---------|-----------|--------|----------|
-| **Objects Tracked** | 100K+ | ~30K | ~25K | ~20K | 10K+ (LEO only) |
-| **Orbital Regimes** | LEO/MEO/GEO/Cislunar | LEO | LEO/MEO | LEO | LEO |
-| **Update Frequency** | Real-time | Near real-time | Near real-time | Batch | Real-time |
-| **Conjunction Lead Time** | 7+ days | 5-7 days | 3-5 days | 3-7 days | 1-3 days |
-| **Maneuver Optimization** | ✅ Fuel-optimal | ❌ | ❌ | ✅ | ❌ |
-| **False Positive Rate** | Low (graph-filtered) | Medium | Medium | Medium | Low |
-| **Data Latency** | < 1 min | 5-15 min | 5-10 min | 15-30 min | < 1 min |
+| Metric | AOS | LeoLabs | Slingshot | Planet | Kayhan | Stargaze |
+|--------|-----|---------|-----------|--------|--------|----------|
+| **Objects Tracked** | 100K+ | ~30K | ~25K | ~20K (active sats) | ~20K | 10K+ (LEO only) |
+| **Orbital Regimes** | LEO/MEO/GEO/Cislunar | LEO | LEO/MEO | LEO | LEO | LEO |
+| **Update Frequency** | Real-time | Near real-time | Near real-time | Daily (imaging) | Batch | Real-time |
+| **Conjunction Lead Time** | 7+ days | 5-7 days | 3-5 days | 3-7 days | 3-7 days | 1-3 days |
+| **Maneuver Optimization** | ✅ Fuel-optimal | ❌ | ❌ | ❌ | ✅ | ❌ |
+| **False Positive Rate** | Low (graph-filtered) | Medium | Medium | Medium | Medium | Low |
+| **Data Latency** | < 1 min | 5-15 min | 5-10 min | 24h (imaging) | 15-30 min | < 1 min |
 
 ### Competitive Positioning
 
@@ -822,6 +1048,7 @@ quadrantChart
     AOS: [0.9, 0.9]
     LeoLabs: [0.6, 0.3]
     Slingshot: [0.5, 0.3]
+    Planet: [0.4, 0.2]
     Kayhan: [0.4, 0.4]
     Stargaze: [0.3, 0.5]
 ```
@@ -943,6 +1170,15 @@ pytest tests/ --cov=src --cov-report=html
 | Debris Tracking | 12+ | ~88% |
 | Maneuver Planner | 15+ | ~85% |
 | TLE Ingestion | 25+ | ~90% |
+
+### Test Statistics
+
+| Metric | Value |
+|--------|-------|
+| **Total Tests** | 640+ |
+| **Test Files** | 22 |
+| **Test Topics** | 10 |
+| **Overall Coverage** | ~90% |
 
 ---
 
